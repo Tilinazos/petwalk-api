@@ -1,0 +1,17 @@
+
+# Entorno Virtual
+venv/
+
+# Archivos generados de Python
+__pycache__/
+*.pyc
+
+
+__init__.py
+
+# Archivos de OSMnx y Dataset
+data/lima_graph.pkl
+
+# Logs y otros temporales
+*.log
+.DS_Store
