@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+networkx
+osmnx
+pydantic
+pickle
+typing_extensions
+geopandas
