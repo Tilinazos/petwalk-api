@@ -6,3 +6,4 @@ pydantic
 pickle
 typing_extensions
 geopandas
+pyproj

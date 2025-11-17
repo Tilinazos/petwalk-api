@@ -2,460 +2,342 @@
 import networkx as nx
 import sys
 import random
-from typing import List, Tuple, Optional, Set
+from typing import List, Optional, Tuple, Set
 # Importaciones de módulos internos
-from app.core.config.config import WALKING_PACING 
+from app.core.config.config import WALKING_PACING
 from app.core.data_access.graph_repository import get_graph, get_closest_node
-import osmnx as ox
 from app.core.utils.geometry_utils import calculate_edge_time
 from app.models.api.OptimizationRequest import OptimizationRequest
 from app.models.api.RouteResponse import RouteResponse
-from app.models.api.OptimizationRequest import Coordinate 
+from app.models.api.OptimizationRequest import Coordinate
+import osmnx as ox
+from pyproj import Transformer
 
-# --- CONSTANTES OPTIMIZADAS ---
-TIME_TOLERANCE = 0.35  # Tolerancia del 35% en el tiempo (muy flexible)
-MAX_ATTEMPTS = 300     # Número máximo de intentos de búsqueda
-REVISIT_PENALTY = 1.5  # Penalización MUY suave por revisitar nodos
-RETURN_HOME_THRESHOLD = 0.5  # A partir del 50% del tiempo, priorizar retorno
-MIN_CYCLE_NODES = 20   # Mínimo de nodos para considerar un ciclo válido
+# Constantes optimizadas
+TIME_TOLERANCE = 0.25  # 25% de tolerancia
+REVISIT_PENALTY = 2.0  # Penalización suave
+MIN_CYCLE_NODES = 10   # Mínimo de nodos para ciclo válido
+MAX_ITERATIONS = 3000  # Máximo de iteraciones por intento
+
+
+def _find_best_start_node(G: nx.MultiDiGraph, lat: float, lon: float) -> Tuple[int, int]:
+    """
+    Encuentra el mejor nodo de inicio con buena conectividad.
+    """
+    print(f"\n🔍 Buscando nodo con buena conectividad cerca de ({lat}, {lon})...")
+    
+    # Detectar si el grafo está proyectado
+    sample_node = list(G.nodes(data=True))[0]
+    sample_x = sample_node[1].get('x', 0)
+    sample_y = sample_node[1].get('y', 0)
+    is_projected = abs(sample_x) > 180 or abs(sample_y) > 90
+    
+    print(f"   📐 Tipo de grafo: {'PROYECTADO' if is_projected else 'GEOGRÁFICO'}")
+    
+    search_x, search_y = lon, lat
+    
+    if is_projected:
+        try:
+            graph_crs = G.graph.get('crs', None)
+            if graph_crs:
+                transformer = Transformer.from_crs("EPSG:4326", graph_crs, always_xy=True)
+                search_x, search_y = transformer.transform(lon, lat)
+                print(f"   ✓ Coordenadas proyectadas: ({search_x:.2f}, {search_y:.2f})")
+        except Exception as e:
+            print(f"   ⚠️  Error al proyectar: {e}")
+    
+    # Búsqueda de candidatos
+    candidates = []
+    for node, data in G.nodes(data=True):
+        degree = G.degree(node)
+        if degree < 2:
+            continue
+        
+        try:
+            node_x = data.get('x', 0)
+            node_y = data.get('y', 0)
+            dist = ((node_x - search_x)**2 + (node_y - search_y)**2)**0.5
+            
+            max_dist = 2000 if is_projected else 0.02
+            if dist < max_dist:
+                candidates.append((node, dist, degree))
+        except (KeyError, TypeError):
+            continue
+    
+    if not candidates:
+        raise ValueError(f"No se encontraron nodos cerca de ({lat}, {lon})")
+    
+    # Ordenar por conectividad y distancia
+    candidates.sort(key=lambda x: (-x[2], x[1]))
+    best_node, best_dist, best_degree = candidates[0]
+    
+    print(f"   ✅ Nodo seleccionado: {best_node}")
+    print(f"      - Conexiones: {best_degree}")
+    print(f"      - Distancia: {best_dist:.1f} {'m' if is_projected else '°'}")
+    
+    return best_node, best_degree
 
 
 def _calculate_distance_to_start(G: nx.MultiDiGraph, node: int, start_node: int) -> float:
-    """Calcula la distancia euclidiana entre un nodo y el nodo de inicio"""
+    """Calcula distancia euclidiana entre dos nodos"""
     try:
-        node_data = G.nodes[node]
-        start_data = G.nodes[start_node]
-        
-        # Manejar tanto coordenadas proyectadas (x, y) como geográficas (lat, lon)
-        if 'x' in node_data and 'y' in start_data:
-            dx = float(node_data['x']) - float(start_data['x'])
-            dy = float(node_data['y']) - float(start_data['y'])
-        else:
-            # Fallback a lat/lon si no hay x/y
-            dx = (float(node_data.get('lon', 0)) - float(start_data.get('lon', 0))) * 111000
-            dy = (float(node_data.get('lat', 0)) - float(start_data.get('lat', 0))) * 111000
-        
+        n1 = G.nodes[node]
+        n2 = G.nodes[start_node]
+        dx = float(n1.get('x', 0)) - float(n2.get('x', 0))
+        dy = float(n1.get('y', 0)) - float(n2.get('y', 0))
         return (dx**2 + dy**2)**0.5
-    except Exception as e:
-        return float('inf')
-
-
-def _get_weighted_neighbor(
-    G: nx.MultiDiGraph, 
-    current_node: int, 
-    start_node: int,
-    visited_nodes: Set[int],
-    previous_node: Optional[int],
-    time_progress: float
-) -> Optional[int]:
-    """
-    Selecciona el siguiente vecino usando una estrategia heurística:
-    - Al inicio: exploración más aleatoria
-    - Después del 50% del tiempo: prioriza acercarse al inicio
-    - Siempre permite revisitar nodos (con penalización suave)
-    """
-    
-    neighbors = []
-    weights = []
-    
-    for _, neighbor, edge_key, edge_data in G.edges(current_node, keys=True, data=True):
-        # Evitar retroceso inmediato
-        if previous_node and neighbor == previous_node:
-            continue
-            
-        # Si es el nodo de inicio y ya tenemos un camino razonable
-        if neighbor == start_node and len(visited_nodes) > MIN_CYCLE_NODES:
-            # Alta prioridad para cerrar el ciclo si estamos cerca del tiempo objetivo
-            if time_progress > RETURN_HOME_THRESHOLD:
-                # Dar muy alta prioridad al cierre
-                neighbors.append(neighbor)
-                weights.append(100.0)  # Peso muy alto
-                continue
-        
-        neighbors.append(neighbor)
-        
-        # Calcular peso basado en:
-        # 1. Distancia al inicio (importante después del threshold)
-        # 2. Si ya fue visitado (penalización MUY suave)
-        distance_to_start = _calculate_distance_to_start(G, neighbor, start_node)
-        
-        if time_progress > RETURN_HOME_THRESHOLD:
-            # Priorizar cercanía al inicio - usar distancia inversa
-            weight = 10.0 / (distance_to_start / 1000.0 + 0.1)  # Normalizar a km
-        else:
-            # Exploración más aleatoria al inicio
-            weight = 1.0
-            # Pequeño bonus para alejarse del inicio al principio
-            if time_progress < 0.3:
-                weight = (distance_to_start / 1000.0 + 0.1)
-        
-        # Penalizar nodos visitados MUY SUAVEMENTE
-        if neighbor in visited_nodes and neighbor != start_node:
-            weight *= (1.0 / REVISIT_PENALTY)
-        
-        weights.append(max(weight, 0.001))  # Evitar pesos negativos o cero
-    
-    if not neighbors:
-        return None
-    
-    # Normalizar pesos
-    total_weight = sum(weights)
-    if total_weight > 0:
-        weights = [w / total_weight for w in weights]
-    else:
-        weights = [1.0 / len(weights)] * len(weights)
-    
-    try:
-        return random.choices(neighbors, weights=weights, k=1)[0]
     except:
-        return random.choice(neighbors) if neighbors else None
+        return float('inf')
 
 
 def _build_route_iterative(
     G: nx.MultiDiGraph,
     start_node: int,
-    request: OptimizationRequest,
+    tiempo_objetivo_segundos: float,
+    tolerancia: float,
+    velocidad_caminata: float,
     attempt: int
 ) -> Optional[Tuple[List[int], float]]:
     """
-    Construye una ruta de forma iterativa usando búsqueda guiada.
+    Construye una ruta de forma ITERATIVA (no recursiva) usando exploración guiada.
+    Similar al algoritmo del script que funciona.
     """
     
-    path_nodes = [start_node]
-    visited_nodes = {start_node}
-    current_time = 0.0
-    target_time = request.max_time_minutes
+    path = [start_node]
+    visited = {start_node}
+    tiempo_actual = 0.0
     
-    max_steps = 2000  # Límite de pasos por intento (aumentado)
-    step_count = 0
+    tiempo_min = tiempo_objetivo_segundos * (1 - tolerancia)
+    tiempo_max = tiempo_objetivo_segundos * (1 + tolerancia)
     
-    # Variable para tracking de intentos de cierre
-    attempts_to_close = 0
-    max_close_attempts = 50
+    iterations = 0
     
-    while step_count < max_steps:
-        step_count += 1
-        current_node = path_nodes[-1]
-        previous_node = path_nodes[-2] if len(path_nodes) > 1 else None
+    while iterations < MAX_ITERATIONS:
+        iterations += 1
+        current_node = path[-1]
+        previous_node = path[-2] if len(path) > 1 else None
         
-        # Calcular progreso de tiempo
-        time_progress = current_time / target_time if target_time > 0 else 0
+        # Calcular progreso
+        progreso = tiempo_actual / tiempo_objetivo_segundos if tiempo_objetivo_segundos > 0 else 0
         
         # Verificar si podemos cerrar el ciclo
-        if len(path_nodes) > MIN_CYCLE_NODES and current_node == start_node:
-            time_min = target_time * (1 - TIME_TOLERANCE)
-            time_max = target_time * (1 + TIME_TOLERANCE)
-            
-            if time_min <= current_time <= time_max:
-                return (path_nodes, current_time)
-            elif current_time < time_min:
-                # Continuar explorando si el tiempo es muy corto (pero con límite)
-                attempts_to_close += 1
-                if attempts_to_close > max_close_attempts:
-                    return None  # Demasiados intentos de cierre prematuro
+        if len(path) > MIN_CYCLE_NODES and current_node == start_node:
+            if tiempo_min <= tiempo_actual <= tiempo_max:
+                print(f"      ✓ Ciclo válido encontrado: {len(path)} nodos, {tiempo_actual/60:.1f} min")
+                return (path, tiempo_actual)
+            elif tiempo_actual < tiempo_min:
+                # Demasiado corto, seguir explorando
+                pass
             else:
-                # Tiempo excedido, este intento falló
+                # Demasiado largo, falló
                 return None
         
-        # Verificar si excedemos el tiempo máximo
-        if current_time > target_time * (1 + TIME_TOLERANCE):
+        # Si excedemos tiempo, falló
+        if tiempo_actual > tiempo_max:
             return None
         
-        # Estrategia especial: si estamos cerca del tiempo objetivo y cerca del inicio, intentar cerrar
-        if time_progress > 0.7 and len(path_nodes) > MIN_CYCLE_NODES:
-            # Verificar si hay camino directo al inicio
-            if G.has_edge(current_node, start_node):
-                edge_data = G.get_edge_data(current_node, start_node, key=0)
-                edge_time = calculate_edge_time(edge_data.get('length', 0), request.walking_pace)
-                projected_time = current_time + edge_time
+        # Obtener vecinos
+        neighbors = list(G.neighbors(current_node))
+        
+        if not neighbors:
+            return None
+        
+        # Filtrar retroceso inmediato
+        if previous_node:
+            neighbors = [n for n in neighbors if n != previous_node]
+        
+        if not neighbors:
+            return None
+        
+        # ESTRATEGIA DE SELECCIÓN DE VECINO
+        # - Si progreso < 50%: exploración aleatoria (alejarse del inicio)
+        # - Si progreso >= 50%: priorizar regresar al inicio
+        
+        if progreso < 0.5:
+            # Fase de exploración: selección más aleatoria
+            # Pequeña preferencia por alejarse del inicio
+            weights = []
+            for n in neighbors:
+                dist_to_start = _calculate_distance_to_start(G, n, start_node)
+                # Premiar alejarse del inicio
+                weight = 1.0 + (dist_to_start / 10000.0)  # Normalizar
                 
-                time_min = target_time * (1 - TIME_TOLERANCE)
-                time_max = target_time * (1 + TIME_TOLERANCE)
+                # Penalizar ligeramente nodos visitados
+                if n in visited and n != start_node:
+                    weight *= 0.5
                 
-                if time_min <= projected_time <= time_max:
-                    # ¡Cierre perfecto encontrado!
-                    path_nodes.append(start_node)
-                    return (path_nodes, projected_time)
-        
-        # Seleccionar siguiente vecino
-        next_node = _get_weighted_neighbor(
-            G, current_node, start_node, visited_nodes, previous_node, time_progress
-        )
-        
-        if next_node is None:
-            # Sin vecinos disponibles, este intento falló
-            return None
-        
-        # Calcular tiempo de la arista
-        edge_data = G.get_edge_data(current_node, next_node, key=0)
-        if not edge_data:
-            return None
+                weights.append(max(weight, 0.1))
             
-        edge_length = edge_data.get('length', 0)
-        edge_time = calculate_edge_time(edge_length, request.walking_pace)
+            # Normalizar
+            total = sum(weights)
+            if total > 0:
+                weights = [w/total for w in weights]
+            
+            try:
+                next_node = random.choices(neighbors, weights=weights, k=1)[0]
+            except:
+                next_node = random.choice(neighbors)
+        else:
+            # Fase de retorno: priorizar acercarse al inicio
+            # Si el inicio es vecino y el tiempo está bien, ir al inicio
+            if start_node in neighbors:
+                edge_data = G.get_edge_data(current_node, start_node, key=0)
+                if edge_data:
+                    edge_time = edge_data['length'] / velocidad_caminata
+                    tiempo_proyectado = tiempo_actual + edge_time
+                    
+                    if tiempo_min <= tiempo_proyectado <= tiempo_max:
+                        # ¡Cerrar el ciclo ahora!
+                        path.append(start_node)
+                        return (path, tiempo_proyectado)
+            
+            # Seleccionar vecino más cercano al inicio
+            best_neighbor = None
+            best_dist = float('inf')
+            
+            for n in neighbors:
+                dist = _calculate_distance_to_start(G, n, start_node)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_neighbor = n
+            
+            next_node = best_neighbor if best_neighbor else random.choice(neighbors)
         
-        # Aplicar penalización si revisitamos (muy suave ahora)
-        if next_node in visited_nodes and next_node != start_node:
+        # Calcular costo de la arista
+        edge_data = G.get_edge_data(current_node, next_node, key=0)
+        if not edge_data or 'length' not in edge_data:
+            return None
+        
+        edge_time = edge_data['length'] / velocidad_caminata
+        
+        # Penalización suave por revisitar
+        if next_node in visited and next_node != start_node:
             edge_time *= REVISIT_PENALTY
         
         # Actualizar estado
-        path_nodes.append(next_node)
-        visited_nodes.add(next_node)
-        current_time += edge_time
+        path.append(next_node)
+        visited.add(next_node)
+        tiempo_actual += edge_time
     
-    # Alcanzamos el límite de pasos sin encontrar solución
+    # Máximo de iteraciones alcanzado
     return None
-
-
-def _get_walking_pace_value(pace_str: str) -> float:
-    """
-    Convierte el string de walking_pace a un valor numérico en m/s
-    """
-    pace_map = {
-        "lento": 1.0,      # 3.6 km/h
-        "ligero": 1.2,     # 4.3 km/h  
-        "normal": 1.2,     # 4.3 km/h
-        "rapido": 1.4,     # 5.0 km/h
-        "muy_rapido": 1.6  # 5.8 km/h
-    }
-    
-    pace_lower = pace_str.lower() if isinstance(pace_str, str) else "ligero"
-    return pace_map.get(pace_lower, 1.2)  # Default: ligero
 
 
 def optimize_route(request: OptimizationRequest) -> RouteResponse:
     """
-    Función principal para optimizar rutas circulares.
-    Utiliza búsqueda iterativa con múltiples intentos aleatorios.
+    Orquestador principal con búsqueda iterativa.
     """
+    print("\n" + "="*70)
+    print("🐾 INICIANDO BÚSQUEDA DE PASEO PERFECTO")
+    print("="*70)
     
-    # Convertir walking_pace si viene como string
-    if isinstance(request.walking_pace, str):
-        walking_pace_value = _get_walking_pace_value(request.walking_pace)
-    else:
-        walking_pace_value = float(request.walking_pace)
-    
-    print(f"\n🚶 Walking pace: {request.walking_pace} -> {walking_pace_value} m/s")
-    
-    # Obtener el grafo de la red vial
     G = get_graph()
+    print(f"📊 Grafo: {len(G.nodes)} nodos, {len(G.edges)} aristas")
     
-    print(f"\n📍 Buscando nodo inicial cerca de ({request.start_lat}, {request.start_lon})")
-    print(f"📊 Grafo tiene {len(G.nodes)} nodos y {len(G.edges)} aristas")
+    # Encontrar nodo de inicio
+    start_node_osmid, node_degree = _find_best_start_node(
+        G, request.start_lat, request.start_lon
+    )
     
-    # Verificar si el grafo está proyectado o en coordenadas geográficas
-    sample_node = list(G.nodes(data=True))[0]
-    is_projected = abs(sample_node[1].get('x', 0)) > 180 or abs(sample_node[1].get('y', 0)) > 90
-    print(f"📐 Grafo está {'PROYECTADO' if is_projected else 'en coordenadas GEOGRÁFICAS'}")
-    if is_projected:
-        sample_coords = (sample_node[1].get('y'), sample_node[1].get('x'))
-        print(f"   Ejemplo de coordenadas: {sample_coords}")
+    print(f"\n📍 Nodo de inicio: {start_node_osmid} ({node_degree} conexiones)")
     
-    # 1. Encontrar el nodo más cercano - SIEMPRE usar OSMnx que maneja ambos sistemas
-    start_node_osmid = None
-    try:
-        # OSMnx maneja automáticamente coordenadas proyectadas y geográficas
-        start_node_osmid = ox.nearest_nodes(G, request.start_lon, request.start_lat)
-        print(f"✓ OSMnx encontró nodo: {start_node_osmid}")
-    except Exception as e:
-        print(f"✗ Error con OSMnx: {e}")
-        
-        # Método manual de respaldo
-        print("⚠ Intentando búsqueda manual...")
-        min_dist = float('inf')
-        for node, data in G.nodes(data=True):
-            try:
-                if is_projected:
-                    # El grafo está proyectado, necesitamos proyectar las coordenadas del request
-                    # Por ahora, saltamos este nodo
-                    continue
-                else:
-                    # Coordenadas geográficas
-                    dist = ((data['y'] - request.start_lat)**2 + 
-                           (data['x'] - request.start_lon)**2)**0.5
-                    if dist < min_dist and G.degree(node) >= 2:
-                        min_dist = dist
-                        start_node_osmid = node
-            except:
-                continue
+    # Parámetros
+    tiempo_objetivo_segundos = request.max_time_minutes * 60
+    pace_value = WALKING_PACING.get(request.walking_pace, WALKING_PACING["ligero"])
+    velocidad_caminata = pace_value / 60.0
     
-    if start_node_osmid is None or start_node_osmid not in G:
-        raise ValueError(
-            f"No se pudo encontrar un nodo válido cerca de ({request.start_lat}, {request.start_lon}). "
-            f"Verifica que las coordenadas estén dentro del área del grafo cargado."
-        )
-
-    # Verificar que el nodo tenga conexiones
-    node_degree = G.degree(start_node_osmid)
-    node_coords = (G.nodes[start_node_osmid].get('y'), G.nodes[start_node_osmid].get('x'))
+    print(f"\n⚙️  Configuración:")
+    print(f"   - Tiempo: {request.max_time_minutes} min (±{TIME_TOLERANCE*100}%)")
+    print(f"   - Rango: {request.max_time_minutes*(1-TIME_TOLERANCE):.0f}-{request.max_time_minutes*(1+TIME_TOLERANCE):.0f} min")
+    print(f"   - Velocidad: {velocidad_caminata:.2f} m/s")
     
-    print(f"✓ Nodo encontrado: {start_node_osmid}")
-    print(f"  Coordenadas del nodo: {node_coords}")
-    print(f"  Grado (conexiones): {node_degree}")
+    print(f"\n🔍 Iniciando búsqueda iterativa...")
     
-    if node_degree == 0:
-        print(f"⚠ Nodo sin conexiones, buscando alternativa...")
-        
-        # Buscar nodos cercanos con BUENA conectividad (priorizar nodos con muchas conexiones)
-        nearby_nodes = []
-        for node in G.nodes():
-            degree = G.degree(node)
-            if degree >= 3:  # Al menos 3 conexiones para mejor flexibilidad
-                try:
-                    dist = _calculate_distance_to_start(G, node, start_node_osmid)
-                    if dist < float('inf') and dist < 5000:  # Dentro de 5km en coordenadas proyectadas
-                        nearby_nodes.append((node, dist, degree))
-                except:
-                    continue
-        
-        if not nearby_nodes:
-            # Relajar requisito a 2 conexiones si no encontramos nada
-            print("⚠ No se encontraron nodos con 3+ conexiones, buscando con 2+ conexiones...")
-            for node in G.nodes():
-                degree = G.degree(node)
-                if degree >= 2:
-                    try:
-                        dist = _calculate_distance_to_start(G, node, start_node_osmid)
-                        if dist < float('inf') and dist < 10000:
-                            nearby_nodes.append((node, dist, degree))
-                    except:
-                        continue
-        
-        if not nearby_nodes:
-            raise ValueError(
-                f"No se encontraron calles bien conectadas cerca del punto ({request.start_lat}, {request.start_lon}). "
-                f"El grafo puede no cubrir esta zona adecuadamente."
-            )
-        
-        # Ordenar por conectividad (más conexiones primero) y luego por distancia
-        nearby_nodes.sort(key=lambda x: (-x[2], x[1]))
-        start_node_osmid = nearby_nodes[0][0]
-        new_coords = (G.nodes[start_node_osmid].get('y'), G.nodes[start_node_osmid].get('x'))
-        
-        print(f"✓ Usando nodo alternativo {start_node_osmid}")
-        print(f"  Coordenadas: {new_coords}")
-        print(f"  Conexiones: {nearby_nodes[0][2]}")
-        print(f"  Distancia al punto original: {nearby_nodes[0][1]:.0f}m (proyectadas)")
-        
-        node_degree = nearby_nodes[0][2]
-    
-    # Verificar que el nodo tenga suficientes conexiones para hacer un ciclo
-    if node_degree < 2:
-        raise ValueError(
-            f"El nodo más cercano ({start_node_osmid}) no tiene suficientes conexiones "
-            f"para crear una ruta circular. Prueba con otra ubicación."
-        )
-    
-    # Advertencia si la conectividad es baja
-    if node_degree == 2:
-        print(f"⚠ ADVERTENCIA: El nodo solo tiene 2 conexiones. Será difícil crear ciclos largos.")
-        print(f"   Considera usar una ubicación más céntrica con más calles.")
-
-    print(f"\n{'='*60}")
-    print(f"Iniciando búsqueda de ruta circular")
-    print(f"Nodo inicio: {start_node_osmid}")
-    print(f"Ubicación: ({request.start_lat}, {request.start_lon})")
-    print(f"Tiempo objetivo: {request.max_time_minutes} min (±{TIME_TOLERANCE*100}%)")
-    print(f"Rango aceptable: {request.max_time_minutes*(1-TIME_TOLERANCE):.1f} - {request.max_time_minutes*(1+TIME_TOLERANCE):.1f} min")
-    print(f"{'='*60}\n")
-    
-    # 2. Ejecutar múltiples intentos de búsqueda
+    # Múltiples intentos
+    max_attempts = 20  # Más intentos porque es más rápido
     best_solution = None
     best_time_diff = float('inf')
     
-    # Crear un request modificado con el pace numérico para las funciones internas
-    class RequestWithNumericPace:
-        def __init__(self, original_request, pace_value):
-            self.start_lat = original_request.start_lat
-            self.start_lon = original_request.start_lon
-            self.max_time_minutes = original_request.max_time_minutes
-            self.walking_pace = pace_value
-            self.is_cycle = getattr(original_request, 'is_cycle', True)
-    
-    modified_request = RequestWithNumericPace(request, walking_pace_value)
-    
-    for attempt in range(MAX_ATTEMPTS):
-        result = _build_route_iterative(G, start_node_osmid, modified_request, attempt)
+    for attempt in range(max_attempts):
+        # Ajustar tolerancia gradualmente
+        tolerancia_actual = TIME_TOLERANCE + (attempt * 0.02)
+        
+        result = _build_route_iterative(
+            G, 
+            start_node_osmid, 
+            tiempo_objetivo_segundos,
+            tolerancia_actual,
+            velocidad_caminata,
+            attempt
+        )
         
         if result:
-            path_nodes, total_time = result
-            time_diff = abs(total_time - request.max_time_minutes)
+            path, tiempo = result
+            time_diff = abs(tiempo/60.0 - request.max_time_minutes)
             
-            print(f"Intento {attempt + 1}/{MAX_ATTEMPTS}: ✓ Ruta encontrada - "
-                  f"{len(path_nodes)} nodos, {total_time:.2f} min "
-                  f"(diff: {time_diff:.2f} min)")
+            if (attempt + 1) % 5 == 0 or time_diff < 5:
+                print(f"   Intento {attempt + 1}: ✓ {len(path)} nodos, {tiempo/60:.1f} min")
             
             # Verificar si es solución válida
-            time_min = request.max_time_minutes * (1 - TIME_TOLERANCE)
-            time_max = request.max_time_minutes * (1 + TIME_TOLERANCE)
-            
-            if time_min <= total_time <= time_max:
-                print(f"\n🎉 ¡Solución óptima encontrada en intento {attempt + 1}!")
-                best_solution = result
-                break
-            
-            # Guardar como mejor solución si está más cerca
             if time_diff < best_time_diff:
                 best_solution = result
                 best_time_diff = time_diff
+                
+                # Si está muy cerca, terminar
+                if time_diff < 2:  # Menos de 2 min de diferencia
+                    print(f"   ✅ Solución óptima en intento {attempt + 1}")
+                    break
         else:
-            if (attempt + 1) % 10 == 0:
-                print(f"Intento {attempt + 1}/{MAX_ATTEMPTS}: ✗ Sin solución")
+            if (attempt + 1) % 5 == 0:
+                print(f"   Intento {attempt + 1}: ✗")
     
-    # 3. Validar y Formatear la Respuesta
-    if best_solution is None:
+    # Validar resultado
+    if not best_solution:
         raise ValueError(
-            f"No se encontró una ruta circular después de {MAX_ATTEMPTS} intentos. "
-            f"Punto: ({request.start_lat}, {request.start_lon}), "
-            f"Tiempo: {request.max_time_minutes} min. "
-            f"Sugerencias: (1) Aumenta el tiempo objetivo, "
-            f"(2) Prueba otra ubicación más céntrica, "
-            f"(3) Aumenta MAX_ATTEMPTS en optimizer.py"
+            f"No se encontró ruta después de {max_attempts} intentos.\n\n"
+            f"Sugerencias:\n"
+            f"  1. Reduce el tiempo a 30-60 minutos\n"
+            f"  2. Usa ubicaciones más céntricas\n"
+            f"  3. Cambia a ritmo 'ligero'"
         )
-
-    best_path_nodes, total_time_minutes = best_solution
     
-    print(f"\n{'='*60}")
-    print(f"✓ Ruta final seleccionada:")
-    print(f"  - Nodos: {len(best_path_nodes)}")
-    print(f"  - Tiempo: {total_time_minutes:.2f} min")
-    print(f"  - Es ciclo: {best_path_nodes[0] == best_path_nodes[-1]}")
-    print(f"{'='*60}\n")
+    path, tiempo_total = best_solution
     
-    # 4. Construir la respuesta con coordenadas y métricas
+    print(f"\n✅ Ruta encontrada: {len(path)} nodos, {tiempo_total/60:.1f} min")
+    
+    # Calcular métricas
     route_coordinates = []
-    total_distance_m = 0.0
-    total_quality = 0.0 
+    total_distance = 0.0
+    total_quality = 0.0
     
-    for i, node_osmid in enumerate(best_path_nodes):
-        # Obtener coordenadas del nodo
+    for i, node_id in enumerate(path):
+        node_data = G.nodes[node_id]
+        
         route_coordinates.append(Coordinate(
-            lat=G.nodes[node_osmid]['y'],
-            lon=G.nodes[node_osmid]['x']
+            lat=node_data.get('lat', node_data.get('y', 0)),
+            lon=node_data.get('lon', node_data.get('x', 0))
         ))
         
-        # Sumar distancia y calidad de las aristas
         if i > 0:
-            u = best_path_nodes[i-1]
-            v = node_osmid
-            edge_data = G.get_edge_data(u, v, key=0)
-            
-            if edge_data and 'length' in edge_data:
-                total_distance_m += edge_data['length']
+            edge_data = G.get_edge_data(path[i-1], node_id, key=0)
+            if edge_data:
+                total_distance += edge_data.get('length', 0)
                 total_quality += edge_data.get('quality_score', 0)
-
-    # 5. Devolver la respuesta final
-    time_diff_pct = abs(total_time_minutes - request.max_time_minutes) / request.max_time_minutes * 100
+    
+    tiempo_minutos = tiempo_total / 60.0
+    
+    print(f"\n{'='*70}")
+    print(f"✅ RUTA GENERADA")
+    print(f"{'='*70}")
+    print(f"📏 {total_distance/1000:.2f} km")
+    print(f"⏱️  {tiempo_minutos:.1f} min")
+    print(f"⭐ {total_quality:.1f} pts")
+    print(f"{'='*70}\n")
     
     return RouteResponse(
         route=route_coordinates,
         total_quality=total_quality,
-        total_time_minutes=total_time_minutes,
-        distance_km=total_distance_m / 1000.0, 
-        message=(
-            f"Ruta circular encontrada usando búsqueda aleatoria guiada. "
-            f"Tiempo: {total_time_minutes:.1f} min ({time_diff_pct:.1f}% diff objetivo), "
-            f"Distancia: {total_distance_m/1000:.2f} km, "
-            f"Pasos: {len(best_path_nodes)} nodos."
-        )
+        total_time_minutes=tiempo_minutos,
+        distance_km=total_distance / 1000.0,
+        message=f"Ruta circular de {tiempo_minutos:.0f} min y {total_distance/1000:.1f} km generada."
     )
