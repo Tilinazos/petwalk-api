@@ -27,21 +27,10 @@ def _assign_quality_weights(G: nx.MultiDiGraph, green_geometries_proj):
             
         # 2. BONIFICACIÓN POR PROXIMIDAD A ÁREAS VERDES (Heurística Simplificada)
         
-        # Utilizamos la función ox.nearest_edges para encontrar las aristas cercanas a los polígonos
-        # Sin Geopandas, el cálculo de distancia a polígonos es difícil.
-        # En su lugar, si la arista está en una zona de baja velocidad y es corta, es probable que sea una zona de paseo.
-        
-        # Una heurística más precisa, si no usamos Geopandas, es encontrar los nodos del grafo 
-        # que caen dentro de los polígonos de áreas verdes.
-        
         # Para evitar complejidad, usaremos la heurística de longitud, y bonificamos si es una calle de paseo:
         if ('path' in highway_type or 'footway' in highway_type or 'living_street' in highway_type) and data['length'] < 100:
             score += 2.0  # Bonificación directa si es un camino de paseo corto
         
-        # Una vez que tengas un Geopandas DataFrame (green_geometries_proj),
-        # podrías usar: is_near = green_geometries_proj.buffer(PROXIMITY_THRESHOLD_METERS).contains(edge_midpoint)
-        
-        # Si la lógica de Geopandas es inviable, esta heurística es la mejor opción.
         data['quality_score'] = round(score, 1)
 
 
@@ -65,28 +54,16 @@ def load_graph():
     print(f"INFO: Descargando y procesando grafo para: {DEFAULT_PLACE_NAME}...")
     
     try:
-        # 0. DESCARGAR Y PROYECTAR ÁREAS VERDES
+        # 0. DESCARGAR ÁREAS VERDES (En CRS geográfico)
         print("INFO: Descargando áreas verdes...")
         green_areas = ox.features_from_place(DEFAULT_PLACE_NAME, TAGS_GREEN)
         green_geometries_proj = green_areas['geometry'] 
         print(f"INFO: Se encontraron {len(green_geometries_proj)} áreas verdes.")
 
         # 1. DESCARGAR Y PROCESAR GRAFO VIAL
-        G = ox.graph_from_place(DEFAULT_PLACE_NAME, network_type='walk', retain_all=True)
-        G = ox.project_graph(G) # Esto proyecta el grafo
-
-        # -------------------------------------------------------------------------
-        # --- CORRECCIÓN DEL ERROR 'add_edge_lengths' (La línea anterior fallaba) ---
-        # -------------------------------------------------------------------------
-        try:
-            # Intenta usar la función más robusta en versiones recientes (ox.distance)
-            G = ox.distance.add_edge_lengths(G)
-        except AttributeError:
-            # Si falla, asumimos que las longitudes ya existen tras la proyección, 
-            # o que la función no existe en esta versión.
-            print("ADVERTENCIA: add_edge_lengths no encontrado. Asumiendo que las longitudes están en el grafo.")
-            pass
-        # -------------------------------------------------------------------------
+        # Grafo NO PROYECTADO y SIMPLIFICADO (Idéntico al script)
+        G = ox.graph_from_place(DEFAULT_PLACE_NAME, network_type='walk', simplify=True)
+        G = ox.distance.add_edge_lengths(G)
 
         # 2. ASIGNAR PESOS
         _assign_quality_weights(G, green_geometries_proj) 
@@ -105,23 +82,20 @@ def load_graph():
         raise ConnectionError("No se pudo inicializar el modelo de grafo.")
 
         
-
 # Ejecuta la carga al importar el módulo para que esté listo al iniciar FastAPI
 try:
     load_graph()
 except ConnectionError:
-    # Si falla, la API fallará más tarde al intentar acceder al grafo
     pass 
 
 def get_graph() -> nx.MultiDiGraph:
     """Retorna el objeto NetworkX MultiDiGraph cargado."""
     if _GRAPH is None:
-        # Esto solo debería ocurrir si load_graph falló, pero es un buen chequeo
         raise ConnectionError("El grafo no está disponible en la memoria del servidor.")
     return _GRAPH
 
 def get_closest_node(lat: float, lon: float):
     """Retorna el OSMID del nodo más cercano a las coordenadas dadas."""
     graph = get_graph()
-    # OSMnx requiere (lon, lat) para esta función
+    # Requiere scikit-learn
     return ox.nearest_nodes(graph, lon, lat)

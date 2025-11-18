@@ -7,3 +7,4 @@ pickle
 typing_extensions
 geopandas
 pyproj
+scikit-learn

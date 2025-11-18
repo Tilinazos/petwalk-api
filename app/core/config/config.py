@@ -1,12 +1,14 @@
+# app/core/config/config.py
+
 # --- CONFIGURACIÓN DE DATOS ---
-GRAPH_DATA_PATH = "data/lima_graph.pkl"
-DEFAULT_PLACE_NAME = ["Miraflores, Lima, Peru", "San Isidro, Lima, Peru", "Jesus Maria, Lima, Peru"]
+GRAPH_DATA_PATH = "data/miraflores_graph.pkl" # Simplificado
+DEFAULT_PLACE_NAME = "Miraflores, Lima, Peru" # Simplificado a un solo lugar
 MIN_NODES_REQUIRED = 1500
 
 
 # --- CONFIGURACIÓN DE RITMO DE CAMINATA ---
 WALKING_PACING = {
-    "ligero": 75,  # 4.5 km/h
+    "ligero": 78,  # 4.68 km/h (1.3 m/s)
     "acelerado": 90, # 5.4 km/h
 }
 
