@@ -97,14 +97,14 @@ def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: fl
     
     start_node = get_closest_node(start_lat, start_lon)
     
-    # 1. Definir el límite de búsqueda (60% del tiempo total) aunque yo pondria 50, veremos despues
+    # Definir el límite de búsqueda (60% del tiempo total) aunque yo pondria 50
     velocidad_m_min = WALKING_PACING.get(pace, 78)
     tiempo_ida_min = max_time_minutes * 0.60
     distancia_max_m = velocidad_m_min * tiempo_ida_min
     
     print(f"Distancia máxima de camino (m): {distancia_max_m:.1f}")
     
-    # 2. Búsqueda y Filtrado Heurístico (parques)
+    # Búsqueda y Filtrado Heurístico (parques)
     tags = {"leisure": "park"}
     parques = ox.features.features_from_place(DEFAULT_PLACE_NAME, tags=tags)
     
@@ -130,10 +130,9 @@ def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: fl
     if not parques_candidatos:
         raise ValueError("No hay parques dentro del rango posible según el tiempo disponible.")
     
-    # 3. Ordenar por distancia Haversine (el más lejano primero)
+    # Ordenar por distancia Haversine (el más lejano primero)
     parques_candidatos.sort(key=lambda x: x["dist_aerea"], reverse=True)
 
-    # 4. Verificación con shortest_path_length y coleccionar todos los candidatos
     candidatos_validos = [] # Lista de (nodo_parque, dist_camino_ida)
     
     for candidato in parques_candidatos:
@@ -147,7 +146,6 @@ def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: fl
                 weight="length" 
             )
             
-            # Condición: debe caber en el 60% de la distancia máxima
             if dist_camino_ida <= distancia_max_m:
                 candidatos_validos.append((nodo_parque, dist_camino_ida))
             
@@ -157,10 +155,8 @@ def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: fl
     if not candidatos_validos:
         raise ValueError("No hay parques que sean alcanzables dentro del límite de distancia de ida.")
     
-    # Ordenar por la distancia real de camino (más largo primero)
     candidatos_validos.sort(key=lambda x: x[1], reverse=True)
     
-    # Devolver la lista ordenada de (nodo_parque, distancia_ida)
     return candidatos_validos
 
 
@@ -181,7 +177,6 @@ def _calculate_forward_route(G: nx.MultiDiGraph, start_node: int, park_node: int
         
         data["dog_weight"] = peso
     
-    # USO DEL ALGORITMO A* MANUAL
     return a_star_shortest_path(
         G, 
         start_node, 
@@ -193,17 +188,11 @@ def _calculate_forward_route(G: nx.MultiDiGraph, start_node: int, park_node: int
 
 def _calculate_return_route(G: nx.MultiDiGraph, ruta_ida: List[int], 
                             start_node: int, park_node: int, is_cycle: bool) -> List[int]:
-    """
-    Ruta de VUELTA diferente o igual a la ida, basada en el flag is_cycle.
-    """
     if is_cycle is False:
-        # Si no se desea un ciclo, se usa la misma ruta invertida.
         return ruta_ida[::-1]
 
-    # --- Lógica de Ciclo (is_cycle = True) ---
     H = G.copy()
     
-    # Penalizar aristas de la ruta de ida para forzar un camino distinto
     PENALTY_FACTOR = 10.0 
     edges_ida = list(zip(ruta_ida[:-1], ruta_ida[1:]))
     
@@ -213,14 +202,12 @@ def _calculate_return_route(G: nx.MultiDiGraph, ruta_ida: List[int],
             if "dog_weight" in data:
                 data["dog_weight"] *= PENALTY_FACTOR
         
-        # Penalizar el sentido contrario (si existe el camino de v a u)
+        # Penalizar el sentido contrario
         for key, data in H.get_edge_data(v, u, default={}).items():
             if "dog_weight" in data:
                 data["dog_weight"] *= PENALTY_FACTOR
             
-    # Intentar ruta alternativa
     try:
-        # USO DEL ALGORITMO A* MANUAL
         ruta = a_star_shortest_path(
             H, 
             park_node, 
@@ -230,12 +217,10 @@ def _calculate_return_route(G: nx.MultiDiGraph, ruta_ida: List[int],
         )
         return ruta
     except:
-        # Si no se encuentra ruta distinta con la penalización, usar la misma ruta
         return ruta_ida[::-1]
 
 
 def _get_route_metrics(G: nx.MultiDiGraph, route_nodes: List[int], pace: WalkSpeed) -> Tuple[float, float]:
-    """Calcula distancia y tiempo de la ruta"""
     total_time_minutes = 0.0
     total_distance_km = 0.0
     
@@ -255,12 +240,9 @@ def _get_route_metrics(G: nx.MultiDiGraph, route_nodes: List[int], pace: WalkSpe
 
 
 def optimize_route(request: OptimizationRequest) -> RouteResponse:
-    """
-    Función principal - Bucle de verificación de tiempo total
-    """
     G = get_graph()
     
-    # 1. Obtener la lista de parques candidatos ordenados (nodo, dist_ida)
+    # Obtener la lista de parques candidatos ordenados (nodo, dist_ida)
     try:
         candidatos_ordenados = _find_farthest_park_node(
             G, request.start_lat, request.start_lon, 
@@ -275,32 +257,30 @@ def optimize_route(request: OptimizationRequest) -> RouteResponse:
     
     start_node = get_closest_node(request.start_lat, request.start_lon)
     
-    # 2. Iterar sobre los candidatos (del más lejano al más cercano) y encontrar el primero que cumple el tiempo total
+    # Iterar sobre los candidatos (del más lejano al más cercano) y encontrar el primero que cumple el tiempo total
     for park_node, dist_ida_proxy in candidatos_ordenados:
         
-        # a. Ruta de ida (usa dog_weight y A* manual)
+        # Ruta de ida
         ruta_ida = _calculate_forward_route(G, start_node, park_node)
         
-        # b. Ruta de vuelta (usa dog_weight, A* manual y penalización/is_cycle)
+        # Ruta de vuelta
         ruta_vuelta = _calculate_return_route(G, ruta_ida, start_node, park_node, request.is_cycle)
         
-        # c. Combinar ruta completa
+        # Combinar ruta completa
         full_route_nodes = ruta_ida + ruta_vuelta[1:]
         
         if full_route_nodes is None or len(full_route_nodes) <= 1:
             continue
         
-        # d. Calcular métricas totales (tiempo y distancia)
+        # Calcular métricas totales (tiempo y distancia)
         total_time_minutes, total_distance_km = _get_route_metrics(
             G, full_route_nodes, request.walking_pace
         )
         
-        # e. Condición de ÉXITO: Si el tiempo total cumple el límite
         if total_time_minutes <= request.max_time_minutes:
             
             message = f"Ruta óptima encontrada. Tiempo total: {total_time_minutes:.1f} min."
             
-            # f. Convertir a coordenadas y retornar respuesta
             route_coordinates: List[Coordinate] = []
             try:
                 for node_id in full_route_nodes:
@@ -317,5 +297,4 @@ def optimize_route(request: OptimizationRequest) -> RouteResponse:
                 message=message
             )
             
-    # 3. Si el bucle termina sin encontrar una ruta válida
     raise ValueError(f"Ningún parque encontrado permite un paseo completo dentro del límite de {request.max_time_minutes} minutos.")
