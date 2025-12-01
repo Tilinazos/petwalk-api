@@ -1,9 +1,8 @@
-# app/services/route_optimizer/optimizer.py
 from typing import List, Tuple
 import networkx as nx
 import osmnx as ox
 from math import radians, cos, sin, sqrt, atan2
-import heapq # Necesario para la Cola de Prioridad (implementación manual de A*)
+
 
 from app.models.api.OptimizationRequest import OptimizationRequest, WalkSpeed, Coordinate
 from app.models.api.RouteResponse import RouteResponse
@@ -13,8 +12,8 @@ from app.core.utils.geometry_utils import calculate_edge_time
 
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Cálculo de distancia haversine (Distancia de círculo máximo en metros)"""
-    R = 6371000
+    # Radio de la Tierra en metros R = 6371000  
+    R = 6372795.477598
     phi1, phi2 = radians(lat1), radians(lat2)
     dphi = radians(lat2 - lat1)
     dlambda = radians(lon2 - lon1)
@@ -24,10 +23,7 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def heuristic_haversine(u: int, v: int, G: nx.MultiDiGraph) -> float:
-    """
-    Heurística (h(n)) para A*: calcula la distancia Haversine (en metros) 
-    entre dos nodos del grafo.
-    """
+    # Heurística h(n) para A*: calcula la distancia Haversine (en metros) entre dos nodos del grafo
     u_data = G.nodes[u]
     v_data = G.nodes[v]
     # 'y' es latitud, 'x' es longitud en OSMnx/NetworkX
@@ -36,15 +32,11 @@ def heuristic_haversine(u: int, v: int, G: nx.MultiDiGraph) -> float:
 
 def a_star_shortest_path(G: nx.MultiDiGraph, source: int, target: int, 
                          heuristic, weight: str = "length") -> List[int]:
-    """
-    IMPLEMENTACIÓN MANUAL del algoritmo A* (A-ESTRELLA) SIN LIBRERÍAS EXTERNAS (heapq).
-    Utiliza una lista simple para simular la cola de prioridad.
-    """
     # 1. Inicialización
-    g_cost = {node: float('inf') for node in G.nodes}  # Costo real (g(n))
+    g_cost = {node: float('inf') for node in G.nodes}  # Costo real g(n)
     g_cost[source] = 0
     
-    f_cost = {node: float('inf') for node in G.nodes}  # Costo total estimado (F(n) = g + h)
+    f_cost = {node: float('inf') for node in G.nodes}  # Costo total estimado F(n) = g + h
     f_cost[source] = heuristic(source, target, G)
     
     predecessor = {node: None for node in G.nodes}
@@ -55,17 +47,14 @@ def a_star_shortest_path(G: nx.MultiDiGraph, source: int, target: int,
     # 2. Bucle Principal
     while open_set:
         
-        # --- Lógica de la Cola de Prioridad Manual (O(V) por iteración) ---
         # Encuentra el nodo 'u' con el mínimo f_cost
         u = min(open_set, key=lambda node: f_cost[node])
         
-        # Lo remueve del conjunto abierto
+        # open_set: caminos por explorar
         open_set.remove(u)
         # -------------------------------------------------------------------
 
-        # Condición de éxito
         if u == target:
-            # Reconstrucción del camino
             path = []
             current = u
             while current is not None:
@@ -73,7 +62,7 @@ def a_star_shortest_path(G: nx.MultiDiGraph, source: int, target: int,
                 current = predecessor.get(current)
             return path[::-1] # Retorna el camino invertido
 
-        # 3. Expansión y Relajación de vecinos
+        # 3. Expansión de vecinos
         for v in G.neighbors(u):
             
             # Encuentra el costo mínimo de la arista (u, v) para el peso especificado
@@ -85,7 +74,7 @@ def a_star_shortest_path(G: nx.MultiDiGraph, source: int, target: int,
 
             tentative_g_cost = g_cost[u] + min_edge_cost
 
-            # Relajación: Si encontramos un camino más corto a v
+            # Si encontramos un camino más corto a v
             if tentative_g_cost < g_cost[v]:
                 predecessor[v] = u
                 g_cost[v] = tentative_g_cost
@@ -103,15 +92,12 @@ def a_star_shortest_path(G: nx.MultiDiGraph, source: int, target: int,
 
 def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: float, 
                              max_time_minutes: int, pace: WalkSpeed) -> List[Tuple[int, float]]:
-    """
-    Busca y devuelve una lista de parques candidatos, ordenados del más lejano 
-    al más cercano (usando la distancia de camino real como proxy).
-    """
+
     print("Buscando parques con optimización A* y filtro Haversine...")
     
     start_node = get_closest_node(start_lat, start_lon)
     
-    # 1. Definir el límite de búsqueda (60% del tiempo total)
+    # 1. Definir el límite de búsqueda (60% del tiempo total) aunque yo pondria 50, veremos despues
     velocidad_m_min = WALKING_PACING.get(pace, 78)
     tiempo_ida_min = max_time_minutes * 0.60
     distancia_max_m = velocidad_m_min * tiempo_ida_min
@@ -154,10 +140,6 @@ def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: fl
         nodo_parque = candidato["node"]
         
         try:
-            # Usar shortest_path_length para verificar la distancia REAL del camino
-            # NOTA: Esta función de NetworkX (shortest_path_length) se deja para
-            # eficiencia, ya que la implementación de A* desde cero devuelve la RUTA, 
-            # no solo la longitud, lo que sería más lento de calcular aquí.
             dist_camino_ida = nx.shortest_path_length(
                 G, 
                 source=start_node, 
@@ -183,9 +165,6 @@ def _find_farthest_park_node(G: nx.MultiDiGraph, start_lat: float, start_lon: fl
 
 
 def _calculate_forward_route(G: nx.MultiDiGraph, start_node: int, park_node: int) -> List[int]:
-    """
-    Ruta de IDA con pesos dog-friendly, usando el algoritmo A* MANUAL.
-    """
     # Asignar pesos dog-friendly
     for u, v, data in G.edges(data=True):
         highway = data.get("highway", "")

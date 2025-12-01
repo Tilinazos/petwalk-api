@@ -1,4 +1,3 @@
-# app/core/data_access/graph_repository.py
 import osmnx as ox
 import networkx as nx
 import os
@@ -13,19 +12,18 @@ def load_graph():
         return _GRAPH
 
     if os.path.exists(GRAPH_DATA_PATH):
-        print("INFO: Grafo encontrado. Cargando desde pickle...")
+        print("Grafo encontrado")
         try:
             with open(GRAPH_DATA_PATH, 'rb') as f:
                 _GRAPH = pickle.load(f)
-            print(f"INFO: Grafo cargado con {len(_GRAPH.nodes)} nodos.")
+            print(f"Grafo cargado con {len(_GRAPH.nodes)} nodos")
             return _GRAPH
         except Exception as e:
-            print(f"ERROR: Fallo al cargar el grafo desde pickle: {e}. Se intentará descargar.")
+            print(f"ERROR: Fallo al cargar el grafo: {e}. Se intentará descargar")
             
-    print(f"INFO: Descargando y procesando grafo para: {DEFAULT_PLACE_NAME}...")
+    print(f"Descargando y procesando grafo para: {DEFAULT_PLACE_NAME}")
     
     try:
-        # Descargar grafo simplificado (IGUAL QUE TU SCRIPT)
         G = ox.graph_from_place(DEFAULT_PLACE_NAME, network_type='walk', simplify=True)
         G = ox.distance.add_edge_lengths(G)
         
@@ -35,12 +33,12 @@ def load_graph():
             pickle.dump(G, f)
             
         _GRAPH = G
-        print(f"INFO: Grafo creado y guardado con {len(_GRAPH.nodes)} nodos.")
+        print(f"INFO: Grafo creado y guardado con {len(_GRAPH.nodes)} nodos")
         return _GRAPH
         
     except Exception as e:
         print(f"ERROR: Fallo crítico al descargar el grafo: {e}")
-        raise ConnectionError("No se pudo inicializar el modelo de grafo.")
+        raise ConnectionError("No se pudo inicializar el modelo de grafo")
 
 try:
     load_graph()
